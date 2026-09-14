@@ -1005,6 +1005,12 @@ class RayPPOTrainer:
         batch.batch["critical_step_mask"] = critical_step_mask
         batch.batch["step_skill_mask"] = step_skill_mask
         batch.batch["teacher_signal_mask"] = teacher_signal_mask
+        # Hand this step's hindsight skills to the rollout collector, so the next
+        # rollout of the same task can use them as the privileged context.
+        mix_skills = teacher_signal_batch.meta_info.get("seed_mix_skills")
+        if mix_skills and hasattr(self.traj_collector, "update_mix_skills"):
+            self.traj_collector.update_mix_skills(mix_skills)
+
         skill_gen_payload = self._build_seed_skill_gen_payload(
             batch=batch,
             samples=teacher_signal_batch.meta_info.get("seed_skill_gen_samples"),
@@ -2533,6 +2539,43 @@ class RayPPOTrainer:
         }
         failed_analysis_count = len(episode_analysis) - len(successful_episode_analysis)
 
+        # Carry-over skill bank for two-context mixture rollout: this step's
+        # hindsight skills become the privileged context for the next time the
+        # same task is sampled. Keyed by task description (see seed.mix_pair.task_key)
+        # because batch position and uid are not stable across steps. Published via
+        # meta_info so the caller applies it on the main thread -- analysis may run
+        # in the teacher-signal worker thread.
+        if float(OmegaConf.select(self.config, "algorithm.seed.mix_alpha") or 0.0) > 0.0:
+            from seed.mix_pair import task_key
+
+            # A task has one entry but 8 rollouts, so 8 skills collapse to 1. Under
+            # "success_priority" a skill from a failed episode never displaces one
+            # from a successful episode -- otherwise the survivor is just whichever
+            # trajectory sat last in batch order, which is unrelated to quality.
+            overwrite_mode = str(
+                OmegaConf.select(self.config, "algorithm.seed.mix_skill_overwrite") or "success_priority"
+            )
+            threshold = self._get_seed_failure_success_threshold()
+            mix_skills: Dict[str, Dict[str, Any]] = {}
+            for traj_uid, analysis in successful_episode_analysis.items():
+                key = task_key(analysis.get("task_description", ""))
+                skill = str(analysis.get("episode_skill", "") or "").strip()
+                if not (key and skill):
+                    continue
+                success_value = traj_success.get(traj_uid)
+                success = bool(success_value is not None and float(success_value) >= threshold)
+                prev = mix_skills.get(key)
+                if (
+                    prev is not None
+                    and overwrite_mode == "success_priority"
+                    and prev.get("success")
+                    and not success
+                ):
+                    continue
+                mix_skills[key] = {"skill": skill, "success": success}
+            if mix_skills:
+                batch.meta_info["seed_mix_skills"] = mix_skills
+
         critical_mask_np = np.zeros(batch_size, dtype=bool)
         analyzed_traj_uids = set(successful_episode_analysis.keys())
         for sample_idx, sample_traj_uid in enumerate(batch.non_tensor_batch["traj_uid"]):
@@ -3098,6 +3141,10 @@ class RayPPOTrainer:
                                                                 envs=self.envs,
                                                                 is_train=True,
                                                                 )
+                        # Two-context mixture rollout diagnostics (empty unless
+                        # algorithm.seed.mix_alpha > 0).
+                        if hasattr(self.traj_collector, "pop_mix_stats"):
+                            metrics.update(self.traj_collector.pop_mix_stats())
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)

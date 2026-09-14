@@ -56,6 +56,11 @@ actor_rollout_ref:
     loss_agg_mode: "token-mean" # / "seq-mean-token-sum" / "seq-mean-token-mean"
     opd_loss_coef: 0.0 # OPD-style gated auxiliary distillation loss; 0 disables it. For SEED, enabling this uses teacher/OPD signals as loss instead of teacher advantage.
     opd_gate_beta: 5.0 # sigmoid sharpness for OPD teacher-student gap gating
+    opd_gate_enable: True # False -> ungated distillation (gate == 1); ablation for the confidence gate
+    # Two-context mixture rollout: symmetric clamp (in log space) on the importance
+    # weight exp(old_log_probs - log mu). Only used when the batch carries
+    # mix_row_alpha, i.e. in a mixture run.
+    mix_is_log_clip: 2.0
     skill_gen_loss_coef: 0.0 # SEED skill-generation reward-weighted LM loss; 0 disables it.
     skill_gen_micro_batch_size_per_gpu: null # per-GPU micro batch size for long policy-vllm skill generation samples
     skill_gen_micro_batch_size: 1 # deprecated alias for skill_gen_micro_batch_size_per_gpu
@@ -123,6 +128,10 @@ actor_rollout_ref:
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 1
     use_fire_sampling: False # https://arxiv.org/abs/2410.21236
+    # Register seed.context_mix_lp.ContextMixLogitsProcessor with the engine so
+    # paired requests can be fused into a two-context mixture. Off by default:
+    # it changes engine construction even though it is inert for unpaired requests.
+    mix_enable: False
     prompt_length: ${data.max_prompt_length}  # not use for opensource
     response_length: ${data.max_response_length}
     # for vllm rollout
@@ -308,6 +317,24 @@ algorithm:
     state_group_dump_dir: null # null -> ${trainer.default_local_dir}/seed_state_group
     normalize_teacher_adv: False
     clip_teacher_adv: null
+    # Two-context mixture rollout: weight on the skill-augmented context when
+    # sampling. 0.0 -> plain single-context SEED, bit for bit. Requires
+    # actor_rollout_ref.rollout.mix_enable=True to register the logits processor.
+    mix_alpha: 0.0
+    # Linear alpha schedule: mix_alpha at the first step -> mix_alpha_end over
+    # mix_alpha_anneal_steps (default: the run's total steps), then held. null
+    # means constant mix_alpha. Annealing to 0 ends training on-policy in the
+    # deployable context.
+    # Carry-over bank overwrite policy when a task already has a skill:
+    # "success_priority" -> a failed episode's skill never displaces a successful
+    # one; "latest" -> unconditional overwrite (survivor = last in batch order).
+    mix_skill_overwrite: success_priority
+    # Where to persist the carry-over bank. null -> <trainer.default_local_dir>/skill_bank.json.
+    # Dumped after every merge (~200KB) and loaded once at first use, so the bank
+    # survives job end / resume and can preheat another run.
+    mix_skill_bank_path: null
+    mix_alpha_end: null
+    mix_alpha_anneal_steps: null
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
     enable: False
     max_num_gen_batches: 10

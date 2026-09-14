@@ -15,6 +15,7 @@
 
 import torch
 import numpy as np
+import json
 import re
 import os
 from verl import DataProto
@@ -28,6 +29,10 @@ from agent_system.environments import EnvironmentManagerBase
 from typing import Any, List, Dict, Optional
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from omegaconf import OmegaConf
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class TrajectoryCollector:
     def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
@@ -43,6 +48,12 @@ class TrajectoryCollector:
         self.tokenizer = tokenizer
         self.processor = processor
         self._sokoban_image_save_error_reported = False
+        # Two-context mixture rollout: task_id -> episode skill used to build the
+        # privileged context. Populated by the trainer from the previous step's
+        # hindsight analysis; empty means every row degenerates to alpha=0.
+        self._mix_skills: Dict[Any, str] = {}
+        self._mix_stats: List[Dict[str, float]] = []
+        self._mix_skills_loaded = False
 
     @staticmethod
     def _object_array(values: List[Any]) -> np.ndarray:
@@ -441,6 +452,342 @@ class TrajectoryCollector:
             images=None,
         )
 
+    # ------------------------------------------------------------------
+    # Two-context mixture rollout (SEED). See seed/mix_pair.py for the math and
+    # seed/context_mix_lp.py for the engine-side logits processor.
+    # ------------------------------------------------------------------
+
+    def set_mix_skills(self, skills: Dict[Any, str]) -> None:
+        """Replace the task -> episode-skill map used to build context 2."""
+        self._mix_skills = dict(skills or {})
+
+    def update_mix_skills(self, skills: Dict[Any, Any]) -> None:
+        """Merge in skills from the latest hindsight analysis (carry-over bank).
+
+        Keys come from seed.mix_pair.task_key, so a task keeps its skill across
+        steps and epochs. `algorithm.seed.mix_skill_overwrite` decides what happens
+        when a task already has a skill:
+
+          success_priority (default) -- a skill distilled from a failed episode
+              never displaces one from a successful episode. Successes still
+              overwrite each other (latest wins), and failures overwrite failures.
+          latest -- unconditional overwrite, i.e. the survivor is whichever
+              trajectory came last in batch order regardless of outcome.
+        """
+        mode = str(self._config_select("algorithm.seed.mix_skill_overwrite", "success_priority"))
+        for key, entry in (skills or {}).items():
+            if isinstance(entry, dict):
+                skill = str(entry.get("skill", "") or "").strip()
+                success = bool(entry.get("success", False))
+            else:  # tolerate the plain-string form
+                skill, success = str(entry or "").strip(), False
+            if not (key and skill):
+                continue
+            prev = self._mix_skills.get(key)
+            if (
+                prev is not None
+                and mode == "success_priority"
+                and prev.get("success")
+                and not success
+            ):
+                continue
+            self._mix_skills[key] = {"skill": skill, "success": success}
+        self._dump_mix_skills()
+
+    def _mix_skill_bank_path(self) -> Optional[str]:
+        """Where the carry-over bank is persisted; None disables persistence."""
+        path = self._config_select("algorithm.seed.mix_skill_bank_path")
+        if path:
+            return os.path.expanduser(str(path))
+        local_dir = self._config_select("trainer.default_local_dir")
+        if not local_dir:
+            return None
+        return os.path.join(os.path.expanduser(str(local_dir)), "skill_bank.json")
+
+    def _maybe_load_mix_skills(self) -> None:
+        """Load a previously dumped bank once, so resume/preheating works.
+
+        The bank is otherwise driver-process state and is lost on job end, which
+        also means `resume_mode=auto` would restart with an empty bank.
+        """
+        if self._mix_skills_loaded:
+            return
+        self._mix_skills_loaded = True
+        path = self._mix_skill_bank_path()
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception as exc:
+            logger.warning("could not load skill bank from %s: %s", path, exc)
+            return
+        for key, entry in (payload or {}).items():
+            if isinstance(entry, dict) and str(entry.get("skill", "")).strip():
+                self._mix_skills[key] = {
+                    "skill": str(entry["skill"]),
+                    "success": bool(entry.get("success", False)),
+                }
+        logger.info("loaded %d skill-bank entries from %s", len(self._mix_skills), path)
+
+    def _dump_mix_skills(self) -> None:
+        """Atomically persist the bank (tiny: ~200KB at 800 entries)."""
+        path = self._mix_skill_bank_path()
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(self._mix_skills, handle, ensure_ascii=False, indent=1)
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.warning("could not dump skill bank to %s: %s", path, exc)
+
+    def _mix_skill_for(self, task: str) -> str:
+        entry = self._mix_skills.get(task)
+        if isinstance(entry, dict):
+            return str(entry.get("skill", "") or "")
+        return str(entry or "")
+
+    def pop_mix_stats(self) -> Dict[str, float]:
+        """Mean of the per-env-step mixture diagnostics collected this rollout."""
+        records, self._mix_stats = self._mix_stats, []
+        if not records:
+            return {}
+        keys = records[0].keys()
+        stats = {key: float(np.mean([record[key] for record in records])) for key in keys}
+        stats["mix/env_steps"] = float(len(records))
+        logger.info("mixture rollout: %s", stats)
+        return stats
+
+    def _mix_alpha_schedule_steps(self) -> int:
+        """Horizon over which mix_alpha anneals to mix_alpha_end."""
+        for key in (
+            "algorithm.seed.mix_alpha_anneal_steps",
+            "trainer.total_training_steps",
+            "trainer.total_epochs",
+        ):
+            value = self._config_select(key)
+            if value:
+                return max(1, int(value))
+        return 1
+
+    def _mix_alpha(self, phase: str, global_step: Any = None) -> float:
+        """Weight on the privileged context; 0 disables mixing entirely.
+
+        With `algorithm.seed.mix_alpha_end` set, alpha moves linearly from
+        `mix_alpha` at the first step to `mix_alpha_end` over
+        `mix_alpha_anneal_steps` (default: the run's total steps) and holds there.
+        Annealing to 0 is the useful direction: the policy finishes training on
+        purely on-policy data in the deployable context, and the cost returns to
+        1x because the logits processor short-circuits the degenerate case.
+
+        Two hard restrictions:
+
+        * Training only. Validation always runs single-context, because the
+          deployed policy never sees a skill and an evaluated number must not
+          either.
+        * SEED only. The privileged context is built from SEED's hindsight
+          episode skills, and the importance correction lives on the SEED path,
+          so a non-SEED advantage estimator never mixes even if mix_alpha is set.
+        """
+        if phase != "train":
+            return 0.0
+        alpha_start = float(self._config_select("algorithm.seed.mix_alpha", 0.0) or 0.0)
+        alpha_end = self._config_select("algorithm.seed.mix_alpha_end")
+        alpha_end = alpha_start if alpha_end is None else float(alpha_end)
+        for name, value in (("mix_alpha", alpha_start), ("mix_alpha_end", alpha_end)):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"algorithm.seed.{name} must be in [0, 1], got {value}")
+
+        alpha = alpha_start
+        if alpha_end != alpha_start and global_step is not None:
+            horizon = self._mix_alpha_schedule_steps()
+            # global_step is 1-based, so step 1 sits at the start of the schedule.
+            frac = (float(global_step) - 1.0) / max(1.0, float(horizon) - 1.0)
+            frac = min(1.0, max(0.0, frac))
+            alpha = alpha_start + (alpha_end - alpha_start) * frac
+
+        from seed.mix_pair import ALPHA_EPS
+
+        if alpha <= ALPHA_EPS:
+            return 0.0
+        if max(alpha_start, alpha_end) == 0.0:
+            return 0.0
+        adv_estimator = str(self._config_select("algorithm.adv_estimator", ""))
+        if adv_estimator != "seed":
+            raise ValueError(
+                f"algorithm.seed.mix_alpha={alpha_start} requires algorithm.adv_estimator=seed, "
+                f"got {adv_estimator!r}: two-context mixture rollout is part of the SEED "
+                "algorithm (it needs SEED's hindsight skills and its importance correction)."
+            )
+        return alpha
+
+    def _build_mix_pair_batch(
+        self,
+        batch: DataProto,
+        batch_input: DataProto,
+        alpha: float,
+        sample_ids: np.ndarray,
+        step_ids: np.ndarray,
+        world_size: int,
+    ):
+        """Turn a single-context rollout batch into an interleaved pair batch.
+
+        Returns (paired_batch_input, per_row_alpha) where row 2i is the
+        deployable context and row 2i+1 the skill-augmented one. Returns
+        (batch_input, None) when no row has a skill to inject, so the caller
+        falls back to the ordinary single-context path at 1x cost.
+        """
+        from seed.mix_pair import MIX_META_KEY, ROLE_C1, ROLE_C2, interleave_indices, pair_seed, task_key
+        from seed.prompting import build_augmented_observation_text
+
+        if "multi_modal_data" in batch_input.non_tensor_batch:
+            raise NotImplementedError(
+                "Two-context mixture rollout is text-only for now; the privileged "
+                "context would have to repack image tokens as well."
+            )
+
+        self._maybe_load_mix_skills()
+        batch_size = len(batch_input)
+        obs_texts = batch.non_tensor_batch["obs_text"]
+        data_sources = batch.non_tensor_batch.get("data_source")
+
+        aug_texts: List[str] = []
+        row_alpha = np.zeros(batch_size, dtype=np.float32)
+        for row in range(batch_size):
+            base_text = self._to_text(obs_texts[row])
+            # Carry-over bank: the skill this task earned from a previous episode.
+            # SEED_MIX_DEBUG_SKILL forces one for smoke tests; not a training path.
+            skill = str(
+                os.environ.get("SEED_MIX_DEBUG_SKILL")
+                or self._mix_skill_for(task_key(base_text))
+                or ""
+            )
+            if skill:
+                aug_texts.append(
+                    build_augmented_observation_text(observation=base_text, episode_skill=skill)
+                )
+                row_alpha[row] = alpha
+            else:
+                # No skill for this task yet: context 2 == context 1 and alpha 0,
+                # which the logits processor short-circuits to plain sampling.
+                aug_texts.append(base_text)
+        if not row_alpha.any():
+            return batch_input, None
+
+        prompt_length = int(self.config.data.max_prompt_length)
+        n_truncated = sum(
+            1
+            for row in range(batch_size)
+            if row_alpha[row] > 0
+            and len(self.tokenizer.encode(aug_texts[row], add_special_tokens=False)) > prompt_length
+        )
+        if n_truncated:
+            logger.warning(
+                "mixture rollout: %d/%d privileged prompts exceed data.max_prompt_length=%d and will be "
+                "truncated (%s), which can cut the skill block itself -- raise max_prompt_length",
+                n_truncated,
+                batch_size,
+                prompt_length,
+                self.config.data.truncation,
+            )
+
+        context2 = self.build_text_prompt_batch(
+            obs_contents=aug_texts,
+            data_sources=None if data_sources is None else list(data_sources),
+            meta_info=batch_input.meta_info,
+        )
+        context2_input = context2.select(
+            batch_keys=["input_ids", "attention_mask", "position_ids"],
+            non_tensor_batch_keys=["raw_prompt_ids"],
+        )
+        # DataProto.concat requires both halves to carry the same columns. The
+        # caller may have popped extra per-row metadata (raw_prompt when
+        # data.return_raw_chat=True, tools_kwargs, ...) that the prompt builder
+        # does not emit; mirror context 1's values, since context-2 rows are
+        # dropped right after generation and only their log-probs are used.
+        for key, value in batch_input.non_tensor_batch.items():
+            if key not in context2_input.non_tensor_batch:
+                context2_input.non_tensor_batch[key] = value
+
+        base_seed = int(self._config_select("env.seed", 0) or 0)
+        for half, role in ((batch_input, ROLE_C1), (context2_input, ROLE_C2)):
+            half.non_tensor_batch[MIX_META_KEY] = self._object_array(
+                [
+                    {
+                        "pair_id": str(step_ids[row]),
+                        "role": role,
+                        "alpha": float(row_alpha[row]),
+                        "seed": pair_seed(base_seed, str(step_ids[row])),
+                    }
+                    for row in range(batch_size)
+                ]
+            )
+
+        paired = DataProto.concat([batch_input, context2_input])
+        paired.reorder(torch.as_tensor(interleave_indices(batch_size), dtype=torch.long))
+        paired.meta_info = batch_input.meta_info
+        # The logits processor keeps its pair state per engine, and verl dispatches
+        # by chunking the padded batch into world_size contiguous pieces -- so both
+        # members survive together only if each rank's chunk boundary is even.
+        chunk = (2 * batch_size) // world_size
+        if (2 * batch_size) % world_size or chunk % 2:
+            raise ValueError(
+                f"mixture rollout needs an even per-rank chunk: 2*batch_size={2 * batch_size} "
+                f"over world_size={world_size} gives chunk={chunk}; adjust batch size or GPUs."
+            )
+        return paired, row_alpha
+
+    def _fold_mix_pair_output(self, batch_output: DataProto, row_alpha: np.ndarray) -> DataProto:
+        """Keep the deployable rows and report log mu as their rollout log-prob."""
+        from seed.mix_pair import mixture_logprob  # noqa: F401  (reference impl for the loop form)
+
+        n_pairs = len(batch_output) // 2
+        even = torch.arange(0, 2 * n_pairs, 2)
+        odd = even + 1
+
+        responses = batch_output.batch["responses"]
+        response_length = responses.size(-1)
+        response_mask = batch_output.batch["attention_mask"][:, -response_length:]
+        log_probs = batch_output.batch["rollout_log_probs"]
+
+        ids1, ids2 = responses[even], responses[odd]
+        lp1, lp2 = log_probs[even], log_probs[odd]
+        mask1 = response_mask[even].bool()
+
+        # Fused prefix: tokens up to the first position where the pair diverged.
+        # cumprod stops at the first mismatch, so past a desync we fall back to
+        # log pi(.|c1) -- the pair then really did sample from c1 alone.
+        agree = (ids1 == ids2) & mask1
+        fused = torch.cumprod(agree.long(), dim=-1).bool()
+
+        alpha = torch.as_tensor(row_alpha[:n_pairs], dtype=lp1.dtype, device=lp1.device).unsqueeze(-1)
+        log_w1 = torch.log1p(-alpha)
+        log_w2 = torch.log(alpha.clamp(min=torch.finfo(lp1.dtype).tiny))
+        mu = torch.logaddexp(log_w1 + lp1, log_w2 + lp2)
+        mixed = torch.where(fused & (alpha > 0), mu, lp1)
+
+        n_masked = mask1.sum().clamp(min=1)
+        self._mix_stats.append({
+            "mix/alpha_mean": float(alpha.mean().item()),
+            "mix/active_row_ratio": float((row_alpha[:n_pairs] > 0).mean()),
+            "mix/fused_token_ratio": float((fused & mask1).sum().item() / n_masked.item()),
+            "mix/in_sync_ratio": float(((fused & mask1).sum(-1) == mask1.sum(-1)).float().mean().item()),
+            "mix/logmu_minus_lp1_mean": float(((mixed - lp1) * mask1).sum().item() / n_masked.item()),
+            "mix/bank_size": float(len(self._mix_skills)),
+            "mix/bank_success_ratio": float(
+                np.mean([bool(e.get("success")) for e in self._mix_skills.values() if isinstance(e, dict)])
+            )
+            if self._mix_skills
+            else 0.0,
+        })
+
+        folded = batch_output.select_idxs(even)
+        folded.batch["rollout_log_probs"] = mixed
+        return folded
+
     def preprocess_single_sample(
         self,
         item: int,
@@ -785,11 +1132,48 @@ class TrajectoryCollector:
 
             batch_input.meta_info = gen_batch.meta_info
 
+            # Two-context mixture rollout: sample every token from
+            # (1-alpha)*pi(.|clean) + alpha*pi(.|skill-augmented). Inert at alpha=0.
+            mix_alpha = self._mix_alpha(phase, global_step=global_step)
+            mix_row_alpha = None
+            if mix_alpha > 0.0:
+                step_ids_for_pairs = np.asarray(
+                    [
+                        f"{int(sample_ids[i])}_{int(rollout_ids[i])}_{_step}"
+                        for i in range(batch_size)
+                    ],
+                    dtype=object,
+                )
+                batch_input, mix_row_alpha = self._build_mix_pair_batch(
+                    batch=batch,
+                    batch_input=batch_input,
+                    alpha=mix_alpha,
+                    sample_ids=sample_ids,
+                    step_ids=step_ids_for_pairs,
+                    world_size=actor_rollout_wg.world_size,
+                )
+
             # pad to be divisible by dp_size
             batch_input_padded, pad_size = pad_dataproto_to_divisor(batch_input, actor_rollout_wg.world_size)
             batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
             # # unpad
             batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
+
+            if mix_row_alpha is not None:
+                batch_output = self._fold_mix_pair_output(batch_output, mix_row_alpha)
+
+            if mix_alpha > 0.0:
+                # Per-row marker for the actor's importance correction. Written on
+                # every step of a mixture run (zeros while the skill bank is still
+                # empty), because collate_fn needs the same columns on every step.
+                row_alpha = (
+                    np.zeros(batch_size, dtype=np.float32)
+                    if mix_row_alpha is None
+                    else np.asarray(mix_row_alpha[:batch_size], dtype=np.float32)
+                )
+                batch_output.batch["mix_row_alpha"] = torch.as_tensor(
+                    row_alpha, dtype=torch.float32, device=batch_output.batch["responses"].device
+                )
 
             batch.non_tensor_batch['uid'] = uid_batch
             batch.non_tensor_batch['traj_uid'] = traj_uid

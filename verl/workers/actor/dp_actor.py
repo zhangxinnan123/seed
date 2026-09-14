@@ -32,7 +32,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, compute_policy_loss_gspo, compute_opd_loss, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, compute_policy_loss_gspo, compute_mix_is_weight, compute_opd_loss, kl_penalty
 from verl.trainer.ppo.env_aux_loss_utils import (
     create_inverse_dynamics_messages,
     create_search_inverse_dynamics_messages,
@@ -787,6 +787,12 @@ class DataParallelPPOActor(BasePPOActor):
         )
         if use_opd_loss:
             select_keys.extend(["teacher_log_prob", teacher_mask_key])
+        # Two-context mixture rollout: rollout_log_probs holds log mu, and
+        # mix_row_alpha marks which rows were actually mixed. Present only in
+        # mixture runs, so this self-gates to "under the mix case".
+        use_mix_is = "mix_row_alpha" in data.batch.keys() and "rollout_log_probs" in data.batch.keys()
+        if use_mix_is:
+            select_keys.extend(["rollout_log_probs", "mix_row_alpha"])
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -856,6 +862,20 @@ class DataParallelPPOActor(BasePPOActor):
                     old_log_prob = data["old_log_probs"]
                     advantages = data["advantages"]
 
+                    mix_is_metrics = {}
+                    if use_mix_is:
+                        # w > 0 commutes with min()/clip(), so scaling advantages is
+                        # exactly a per-token weight on the policy-gradient term. KL,
+                        # entropy and OPD are deliberately left uncorrected.
+                        mix_is_weight, mix_is_metrics = compute_mix_is_weight(
+                            old_log_prob=old_log_prob,
+                            rollout_log_prob=data["rollout_log_probs"],
+                            response_mask=response_mask,
+                            mix_row_alpha=data["mix_row_alpha"],
+                            log_clip=float(self.config.get("mix_is_log_clip", 2.0)),
+                        )
+                        advantages = advantages * mix_is_weight
+
                     clip_ratio = self.config.clip_ratio
                     clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
                     clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
@@ -915,6 +935,7 @@ class DataParallelPPOActor(BasePPOActor):
                             response_mask=response_mask,
                             opd_step_mask=data[teacher_mask_key],
                             gate_beta=self.config.get("opd_gate_beta", 5.0),
+                            gate_enable=bool(self.config.get("opd_gate_enable", True)),
                             loss_agg_mode=loss_agg_mode,
                         )
                         policy_loss = policy_loss + opd_loss_coef * opd_loss
@@ -952,6 +973,7 @@ class DataParallelPPOActor(BasePPOActor):
                         "actor/ppo_kl": ppo_kl.detach().item(),
                         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                         "actor/opd_loss": opd_loss.detach().item(),
+                        **mix_is_metrics,
                         "actor/opd_loss_coef": opd_loss_coef,
                         "actor/opd_active_token_ratio": opd_active_token_ratio.detach().item(),
                         "actor/opd_gate_mean": opd_gate_mean.detach().item(),

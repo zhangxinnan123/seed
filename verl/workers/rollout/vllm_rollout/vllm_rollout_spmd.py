@@ -28,6 +28,7 @@ When working with Megatron:
 
 import logging
 import os
+import copy
 from contextlib import contextmanager
 from copy import deepcopy
 from typing import Any, Dict, List, Union
@@ -194,6 +195,15 @@ class vLLMRollout(BaseRollout):
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
         _configure_vllm_sleep_pin_memory()
+        # SEED two-context mixture rollout: the logits processor fuses paired
+        # requests into an arithmetic mixture of two contexts. It is inert for
+        # requests that carry no mix_pair_id, but registering it changes engine
+        # construction, so keep it behind a flag (default off).
+        self.mix_enable = bool(config.get("mix_enable", False))
+        if self.mix_enable:
+            from seed.context_mix_lp import ContextMixLogitsProcessor
+
+            engine_kwargs["logits_processors"] = [ContextMixLogitsProcessor]
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=True,
@@ -255,6 +265,47 @@ class vLLMRollout(BaseRollout):
         # if len(old_sampling_params_args):
         for key, value in old_sampling_params_args.items():
             setattr(self.sampling_params, key, value)
+
+    def _build_mix_sampling_params(self, non_tensor_batch: dict, batch_size: int):
+        """Per-request SamplingParams carrying the two-context mixture metadata.
+
+        Returns None when the batch is not a mixture batch, so the ordinary path
+        keeps passing the single shared SamplingParams object untouched.
+        """
+        from seed.mix_pair import MIX_META_KEY
+
+        if MIX_META_KEY not in non_tensor_batch:
+            return None
+        if not self.mix_enable:
+            raise ValueError(
+                f"batch carries {MIX_META_KEY!r} but actor_rollout_ref.rollout.mix_enable is False, "
+                "so the mixture logits processor was never registered with the engine."
+            )
+
+        from seed.context_mix_lp import validate_mix_params
+
+        mix_meta = non_tensor_batch.pop(MIX_META_KEY)
+        if len(mix_meta) != batch_size:
+            raise ValueError(f"{MIX_META_KEY} has {len(mix_meta)} rows for a batch of {batch_size}")
+
+        params = []
+        for row, meta in enumerate(mix_meta):
+            sp = copy.copy(self.sampling_params)
+            # Truncation would make the sampled distribution something other than
+            # mu, and the pair needs identical noise in both rows.
+            sp.top_p = 1.0
+            sp.top_k = -1
+            sp.min_p = 0.0
+            sp.n = 1
+            sp.seed = int(meta["seed"])
+            sp.extra_args = {
+                "mix_pair_id": str(meta["pair_id"]),
+                "mix_role": int(meta["role"]),
+                "mix_alpha": float(meta["alpha"]),
+            }
+            validate_mix_params(sp, where=f"row {row} (pair {meta['pair_id']} role {meta['role']})")
+            params.append(sp)
+        return params
 
     @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
@@ -340,9 +391,10 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
+            request_sampling_params = self._build_mix_sampling_params(non_tensor_batch, batch_size)
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
+                sampling_params=request_sampling_params if request_sampling_params is not None else self.sampling_params,
                 lora_request=lora_requests,
                 use_tqdm=False,
             )

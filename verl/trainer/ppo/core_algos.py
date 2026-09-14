@@ -492,6 +492,55 @@ def compute_policy_loss(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
+def compute_mix_is_weight(
+    old_log_prob: torch.Tensor,
+    rollout_log_prob: torch.Tensor,
+    response_mask: torch.Tensor,
+    mix_row_alpha: torch.Tensor = None,
+    log_clip: float = 2.0,
+):
+    """Per-token importance weight for two-context mixture rollout.
+
+    Under mixture sampling the behavior policy is
+        mu = (1 - alpha) * pi(.|c1) + alpha * pi(.|c2),
+    but the PPO ratio is built from the actor's clean-context log-probs, so the
+    data is off-policy by exactly log pi_old(.|c1) - log mu. This returns
+
+        w = exp(clamp(old_log_prob - rollout_log_prob, +-log_clip))
+
+    where `rollout_log_prob` holds log mu (written by the rollout collector) and
+    `old_log_prob` is the actor's recomputed clean-context value. Multiplying the
+    advantages by w is exactly equivalent to weighting each token's policy-gradient
+    term, because w > 0 commutes with the min()/clip() in the PPO objective.
+
+    Rows with alpha == 0 were never mixed, so they get w == 1 exactly -- that keeps
+    an alpha=0 run identical to SEED and avoids importing the vLLM-vs-FSDP log-prob
+    discrepancy as a weight on unmixed data.
+    """
+    log_ratio = (old_log_prob - rollout_log_prob).detach()
+    if mix_row_alpha is not None:
+        active = (mix_row_alpha.to(log_ratio.dtype) > 0).to(log_ratio.dtype)
+        if active.dim() == 1:
+            active = active.unsqueeze(-1)
+        log_ratio = log_ratio * active
+    log_ratio = torch.clamp(log_ratio, min=-abs(log_clip), max=abs(log_clip))
+    mask = response_mask.to(log_ratio.dtype)
+    log_ratio = log_ratio * mask
+    weight = torch.exp(log_ratio)
+    weight = torch.where(mask > 0, weight, torch.ones_like(weight))
+
+    n_masked = mask.sum().clamp(min=1.0)
+    metrics = {
+        "actor/mix_is_weight_mean": float(((weight * mask).sum() / n_masked).item()),
+        "actor/mix_is_weight_max": float(weight[mask > 0].max().item()) if bool((mask > 0).any()) else 1.0,
+        "actor/mix_is_log_ratio_mean": float(((log_ratio * mask).sum() / n_masked).item()),
+        "actor/mix_is_clipped_ratio": float(
+            ((log_ratio.abs() >= abs(log_clip) - 1e-6).to(mask.dtype) * mask).sum().item() / n_masked.item()
+        ),
+    }
+    return weight, metrics
+
+
 def compute_opd_loss(
     log_prob: torch.Tensor,
     teacher_log_prob: torch.Tensor,
@@ -499,9 +548,16 @@ def compute_opd_loss(
     opd_step_mask: torch.Tensor = None,
     gate_beta: float = 5.0,
     loss_agg_mode: str = "token-mean",
+    gate_enable: bool = True,
 ):
     """
     Compute OPD-style confidence-gated teacher distillation loss.
+
+    With `gate_enable=False` the gate is replaced by 1, giving plain ungated
+    distillation `loss = teacher_log_prob - log_prob` on the supervised tokens.
+    That is the ablation for "does the confidence gate matter": note the gated
+    version's mean gate runs ~0.48 in practice, so at a fixed opd_loss_coef the
+    ungated loss is roughly 2x stronger.
 
     This keeps the teacher log-probs and the gate detached, so gradients flow
     only through the current policy log-probs:
@@ -556,7 +612,12 @@ def compute_opd_loss(
 
     teacher_log_prob = teacher_log_prob.detach()
     teacher_gap = (teacher_log_prob - log_prob.detach()).detach()
-    opd_gate = torch.sigmoid(float(gate_beta) * teacher_gap).detach()
+    if gate_enable:
+        opd_gate = torch.sigmoid(float(gate_beta) * teacher_gap).detach()
+    else:
+        # Ungated ablation: every supervised token contributes with weight 1, so
+        # the loss no longer stops pushing once the student has caught up.
+        opd_gate = torch.ones_like(teacher_gap)
     opd_loss_mat = opd_gate * (teacher_log_prob - log_prob)
 
     opd_loss = agg_loss(
