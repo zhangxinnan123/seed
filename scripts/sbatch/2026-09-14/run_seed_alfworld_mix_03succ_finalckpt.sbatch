@@ -50,4 +50,4 @@ srun --unbuffered bash /fsx/xinnanzh/SEED/logs/inner_launch.sh \
     actor_rollout_ref.rollout.mix_enable=True \
     algorithm.seed.mix_skill_overwrite=success_priority \
     trainer.save_freq=999999 \
-    "trainer.checkpoint.contents=[model]"
+    "actor_rollout_ref.actor.checkpoint.contents=[model]"
