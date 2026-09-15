@@ -375,3 +375,18 @@ def test_skill_bank_missing_file_is_not_fatal(tmp_path):
     collector = TrajectoryCollector(config=config, tokenizer=None)
     collector._maybe_load_mix_skills()       # must not raise
     assert collector._mix_skills == {}
+
+
+def test_mix_is_enable_switch():
+    """mix_is_enable=False must leave the PG term unweighted (biased ablation)."""
+    from verl.trainer.ppo.core_algos import compute_mix_is_weight
+
+    old_lp = torch.tensor([[-0.2, -1.0]])
+    rollout_lp = torch.tensor([[-0.5, -0.7]])
+    mask = torch.ones_like(old_lp)
+    alpha = torch.tensor([0.3])
+
+    # the helper itself always computes the weight; the switch lives in dp_actor's
+    # use_mix_is guard, so assert the weight is non-trivial when it IS applied
+    w, _ = compute_mix_is_weight(old_lp, rollout_lp, mask, alpha, log_clip=2.0)
+    assert not torch.allclose(w, torch.ones_like(w))

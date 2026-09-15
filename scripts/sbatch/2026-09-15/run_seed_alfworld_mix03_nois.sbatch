@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=seed_mix03_succ_ckpt
+#SBATCH --job-name=seed_mix03_nois
 #SBATCH --partition=ml.p5.48xlarge
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
@@ -24,10 +24,10 @@
 # self-gates on the mix_row_alpha column. KL, entropy and the OPD term stay
 # uncorrected, and rows with alpha=0 get weight exactly 1.
 
-# NOTE: checkpoint.contents cannot drop the optimizer -- FSDPCheckpointManager
-# asserts ['model','optimizer','extra'] are all present, so the single final
-# checkpoint is the full ~36G. Convert with scripts/merge.sh if a small
-# (~6G bf16 HF) artifact is wanted afterwards.
+# Ablation: mixture rollout WITHOUT the importance correction. The PG term uses the
+# actor's clean-context old_log_probs as if the mu-sampled data were on-policy, so it
+# is biased by construction; the point is to measure whether the correction matters.
+# Compare against seed_mix03succ_* (same config, correction on).
 
 set -x
 export TMPDIR=/fsx/xinnanzh/tmp
@@ -45,7 +45,7 @@ conda activate seed
 
 export WANDB_MODE=online
 export WANDB_ENTITY=sean-zhang
-export EXPERIMENT_NAME=seed_mix03succ_ckpt_qwen2.5_3b_alfworld_sft_glm_self_mean-std-norm
+export EXPERIMENT_NAME=seed_mix03_nois_qwen2.5_3b_alfworld_sft_glm_self_mean-std-norm
 
 cd /fsx/xinnanzh/SEED
 nvidia-smi
@@ -54,4 +54,5 @@ srun --unbuffered bash /fsx/xinnanzh/SEED/logs/inner_launch.sh \
     algorithm.seed.mix_alpha=0.3 \
     actor_rollout_ref.rollout.mix_enable=True \
     algorithm.seed.mix_skill_overwrite=success_priority \
-    trainer.save_freq=999999
+    trainer.save_freq=999999 \
+    actor_rollout_ref.actor.mix_is_enable=False

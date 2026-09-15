@@ -61,6 +61,9 @@ actor_rollout_ref:
     # weight exp(old_log_probs - log mu). Only used when the batch carries
     # mix_row_alpha, i.e. in a mixture run.
     mix_is_log_clip: 2.0
+    # False -> train on mu-sampled data without reweighting the PG term (ablation for
+    # whether the mixture importance correction matters). Biased by construction.
+    mix_is_enable: True
     skill_gen_loss_coef: 0.0 # SEED skill-generation reward-weighted LM loss; 0 disables it.
     skill_gen_micro_batch_size_per_gpu: null # per-GPU micro batch size for long policy-vllm skill generation samples
     skill_gen_micro_batch_size: 1 # deprecated alias for skill_gen_micro_batch_size_per_gpu

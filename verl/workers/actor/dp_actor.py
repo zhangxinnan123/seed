@@ -790,7 +790,11 @@ class DataParallelPPOActor(BasePPOActor):
         # Two-context mixture rollout: rollout_log_probs holds log mu, and
         # mix_row_alpha marks which rows were actually mixed. Present only in
         # mixture runs, so this self-gates to "under the mix case".
-        use_mix_is = "mix_row_alpha" in data.batch.keys() and "rollout_log_probs" in data.batch.keys()
+        use_mix_is = (
+            bool(self.config.get("mix_is_enable", True))
+            and "mix_row_alpha" in data.batch.keys()
+            and "rollout_log_probs" in data.batch.keys()
+        )
         if use_mix_is:
             select_keys.extend(["rollout_log_probs", "mix_row_alpha"])
         if multi_turn:
