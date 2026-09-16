@@ -27,7 +27,12 @@ import hashlib
 import math
 from typing import List, Sequence
 
-from seed.context_mix_lp import ROLE_C1, ROLE_C2  # noqa: F401  (re-exported)
+# Roles, mirroring seed.context_mix_lp.ROLE_C1 / ROLE_C2. Defined here rather than
+# imported so this module stays free of vLLM imports: `context_mix_lp` needs the
+# vLLM V1 logits-processor API (vllm>=0.11), and a run with mix_alpha=0.0 must work
+# on older vLLM. Anything that actually fuses logits imports context_mix_lp directly.
+ROLE_C1 = 1
+ROLE_C2 = 2
 
 # Must match _ALPHA_EPS in seed/context_mix_lp.py: inside this band of 0 or 1 the
 # mixture is degenerate and the second context is not worth a forward pass.

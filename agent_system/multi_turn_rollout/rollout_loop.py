@@ -609,11 +609,12 @@ class TrajectoryCollector:
             frac = min(1.0, max(0.0, frac))
             alpha = alpha_start + (alpha_end - alpha_start) * frac
 
+        if max(alpha_start, alpha_end) == 0.0:
+            return 0.0
+
         from seed.mix_pair import ALPHA_EPS
 
         if alpha <= ALPHA_EPS:
-            return 0.0
-        if max(alpha_start, alpha_end) == 0.0:
             return 0.0
         adv_estimator = str(self._config_select("algorithm.adv_estimator", ""))
         if adv_estimator != "seed":

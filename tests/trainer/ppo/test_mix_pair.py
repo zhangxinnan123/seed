@@ -390,3 +390,26 @@ def test_mix_is_enable_switch():
     # use_mix_is guard, so assert the weight is non-trivial when it IS applied
     w, _ = compute_mix_is_weight(old_lp, rollout_lp, mask, alpha, log_clip=2.0)
     assert not torch.allclose(w, torch.ones_like(w))
+
+
+def test_mix_pair_has_no_vllm_import_at_module_level():
+    """seed.mix_pair must import cleanly without the vLLM V1 logits-processor API.
+
+    A run with mix_alpha=0.0 has to work on older vLLM (e.g. 0.8.2 on the A100
+    cluster). Pulling seed.context_mix_lp in at module level broke exactly that:
+    _mix_alpha imported ALPHA_EPS on every rollout step and crashed with
+    ModuleNotFoundError: vllm.v1.sample.logits_processor.
+    """
+    import ast, pathlib
+
+    src = pathlib.Path("seed/mix_pair.py").read_text()
+    tree = ast.parse(src)
+    top_level = []
+    for node in tree.body:  # module level only; function-local imports are fine
+        if isinstance(node, ast.Import):
+            top_level += [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            top_level.append(node.module or "")
+    assert not any("context_mix_lp" in m or m.startswith("vllm") for m in top_level), top_level
+    from seed.mix_pair import ALPHA_EPS, ROLE_C1, ROLE_C2
+    assert (ROLE_C1, ROLE_C2) == (1, 2)
